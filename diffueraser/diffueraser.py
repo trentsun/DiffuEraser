@@ -35,7 +35,7 @@ checkpoints = {
     "Normal CFG 16-Step": ["pcm_{}_normalcfg_16step_converted.safetensors", 16, 7.5],
     "LCM-Like LoRA": [
         "pcm_{}_lcmlike_lora_converted.safetensors",
-        4,
+        2,
         0.0,
     ],
 }
@@ -249,6 +249,7 @@ class DiffuEraser:
                     timestep_spacing="trailing",
                 )
         self.num_inference_steps = checkpoints[ckpt][1]
+        print(f"ckpt: {ckpt}")
         print(f"num_inference_steps: {self.num_inference_steps}")
         self.guidance_scale = 0
 
