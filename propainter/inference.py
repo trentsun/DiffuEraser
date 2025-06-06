@@ -45,25 +45,32 @@ def resize_frames(frames, size=None):
         
     return frames, process_size, out_size
 
-#  read frames from video
-def read_frame_from_videos(frame_root, video_length):
-    if frame_root.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
-        video_name = os.path.basename(frame_root)[:-4]
-        vframes, aframes, info = torchvision.io.read_video(filename=frame_root, pts_unit='sec', end_pts=video_length) # RGB
-        frames = list(vframes.numpy())
-        frames = [Image.fromarray(f) for f in frames]
-        fps = info['video_fps']
-        nframes = len(frames)
-    else:
-        video_name = os.path.basename(frame_root)
-        frames = []
-        fr_lst = sorted(os.listdir(frame_root))
-        for fr in fr_lst:
-            frame = cv2.imread(os.path.join(frame_root, fr))
-            frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            frames.append(frame)
+#  read frames from video or frame array
+def read_frame_from_videos(frame_input, video_length):
+    if isinstance(frame_input, str):  # input is video path
+        if frame_input.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
+            video_name = os.path.basename(frame_input)[:-4]
+            vframes, aframes, info = torchvision.io.read_video(filename=frame_input, pts_unit='sec', end_pts=video_length) # RGB
+            frames = list(vframes.numpy())
+            frames = [Image.fromarray(f) for f in frames]
+            fps = info['video_fps']
+            nframes = len(frames)
+        else:
+            video_name = os.path.basename(frame_input)
+            frames = []
+            fr_lst = sorted(os.listdir(frame_input))
+            for fr in fr_lst:
+                frame = cv2.imread(os.path.join(frame_input, fr))
+                frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                frames.append(frame)
+            fps = None
+            nframes = len(frames)
+    else:  # input is frame array
+        frames = frame_input
+        video_name = "frame_array"
         fps = None
         nframes = len(frames)
+        
     size = frames[0].size
 
     return frames, fps, size, video_name, nframes
@@ -73,34 +80,36 @@ def binary_mask(mask, th=0.1):
     mask[mask<=th] = 0
     return mask
   
-# read frame-wise masks
+# read frame-wise masks from file or mask array
 def read_mask(mpath, frames_len, size, flow_mask_dilates=8, mask_dilates=5):
     masks_img = []
     masks_dilated = []
     flow_masks = []
     
-    if mpath.endswith(('jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG')): # input single img path
-        masks_img = [Image.open(mpath)]
-    elif mpath.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
-        cap = cv2.VideoCapture(mpath)
-        if not cap.isOpened():
-            print("Error: Could not open video.")
-            exit()
-        idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret: 
-                break
-            if(idx >= frames_len):
-                break
-            masks_img.append(Image.fromarray(frame))
-            idx += 1
-        cap.release()
-    else:  
-        mnames = sorted(os.listdir(mpath))
-        for mp in mnames:
-            masks_img.append(Image.open(os.path.join(mpath, mp)))
-            # print(mp)
+    if isinstance(mpath, str):  # input is mask path
+        if mpath.endswith(('jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG')): # input single img path
+            masks_img = [Image.open(mpath)]
+        elif mpath.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
+            cap = cv2.VideoCapture(mpath)
+            if not cap.isOpened():
+                print("Error: Could not open video.")
+                exit()
+            idx = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret: 
+                    break
+                if(idx >= frames_len):
+                    break
+                masks_img.append(Image.fromarray(frame))
+                idx += 1
+            cap.release()
+        else:  
+            mnames = sorted(os.listdir(mpath))
+            for mp in mnames:
+                masks_img.append(Image.open(os.path.join(mpath, mp)))
+    else:  # input is mask array
+        masks_img = mpath
           
     for mask_img in masks_img:
         if size is not None:
@@ -112,9 +121,6 @@ def read_mask(mpath, frames_len, size, flow_mask_dilates=8, mask_dilates=5):
             flow_mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=flow_mask_dilates).astype(np.uint8)
         else:
             flow_mask_img = binary_mask(mask_img).astype(np.uint8)
-        # Close the small holes inside the foreground objects
-        # flow_mask_img = cv2.morphologyEx(flow_mask_img, cv2.MORPH_CLOSE, np.ones((21, 21),np.uint8)).astype(bool)
-        # flow_mask_img = scipy.ndimage.binary_fill_holes(flow_mask_img).astype(np.uint8)
         flow_masks.append(Image.fromarray(flow_mask_img * 255))
         
         if mask_dilates > 0:
@@ -172,9 +178,38 @@ class Propainter:
                                         model_dir=propainter_model_dir, progress=True, file_name=None)
         self.model = InpaintGenerator(model_path=ckpt_path).to(device)
         self.model.eval()
-    def forward(self, video, mask, output_path, resize_ratio=0.6, video_length=2, height=-1, width=-1,
+    def forward(self, video, mask, output_path, resize_ratio=0.6, video_length=None, height=-1, width=-1,
                 mask_dilation=4, ref_stride=10, neighbor_length=10, subvideo_length=80,
                 raft_iter=20, save_fps=24, save_frames=False, fp16=True):
+        """
+        Args:
+            video: 视频路径字符串或帧数组列表(PIL.Image格式)
+            mask: 掩码视频路径字符串或掩码帧数组列表(PIL.Image格式)
+            output_path: 输出视频路径
+            resize_ratio: 调整大小的比例
+            video_length: 视频长度(秒),仅在输入为视频文件时使用,为帧数组时可设为None
+            height: 输出高度(-1表示使用原始高度)
+            width: 输出宽度(-1表示使用原始宽度)
+            mask_dilation: 掩码膨胀迭代次数
+            ref_stride: 参考帧步长
+            neighbor_length: 邻域长度
+            subvideo_length: 子视频长度
+            raft_iter: RAFT迭代次数
+            save_fps: 保存的帧率
+            save_frames: 是否保存帧
+            fp16: 是否使用半精度
+        Returns:
+            output_path: 输出视频路径
+        """
+        print("\n=== ProPainter 处理开始 ===")
+        print(f"处理参数:")
+        print(f"- 调整大小比例: {resize_ratio}")
+        print(f"- 掩码膨胀迭代: {mask_dilation}")
+        print(f"- 参考帧步长: {ref_stride}")
+        print(f"- 邻域长度: {neighbor_length}")
+        print(f"- 子视频长度: {subvideo_length}")
+        print(f"- RAFT迭代次数: {raft_iter}")
+        print(f"- 使用半精度: {fp16}")
         
         # Use fp16 precision during inference to reduce running memory cost
         use_half = True if fp16 else False 
@@ -187,12 +222,19 @@ class Propainter:
         if not width == -1 and not height == -1:
             size = (width, height)
 
+        print(f"\n输入视频信息:")
+        print(f"- 原始尺寸: {size}")
+        print(f"- 帧数: {nframes}")
+        print(f"- FPS: {fps}")
+        
         longer_edge = max(size[0], size[1])
         if(longer_edge > MaxSideThresh): 
             scale = MaxSideThresh / longer_edge
             resize_ratio = resize_ratio * scale
+            print(f"- 边长超过阈值({MaxSideThresh}), 自动调整 resize_ratio 为: {resize_ratio}")
         if not resize_ratio == 1.0:
             size = (int(resize_ratio * size[0]), int(resize_ratio * size[1]))
+            print(f"- 调整后尺寸: {size}")
 
         frames, size, out_size = resize_frames(frames, size)
         fps = save_fps if fps is None else fps
@@ -205,6 +247,10 @@ class Propainter:
         flow_masks = flow_masks[:nframes]
         masks_dilated = masks_dilated[:nframes]
         w, h = size
+        
+        print(f"\n掩码信息:")
+        print(f"- 掩码数量: {len(masks_dilated)}")
+        print(f"- 掩码尺寸: {size}")
 
         ################ adjust input ################ 
         frames_len = min(len(frames), len(masks_dilated))
@@ -217,12 +263,20 @@ class Propainter:
         flow_masks = to_tensors()(flow_masks).unsqueeze(0)
         masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
         frames, flow_masks, masks_dilated = frames.to(self.device), flow_masks.to(self.device), masks_dilated.to(self.device)
+        
+        print(f"\n张量信息:")
+        print(f"- 帧张量形状: {frames.shape}")
+        print(f"- 掩码张量形状: {masks_dilated.shape}")
+        print(f"- 设备: {self.device}")
+        print(f"- 数据类型: {frames.dtype}")
  
         ##############################################
         # ProPainter inference
         ##############################################
         video_length = frames.size(1)
-        print(f'Priori generating: [{video_length} frames]...')
+        print(f"\n=== 开始光流计算 ===")
+        print(f"处理视频长度: {video_length} 帧")
+        
         with torch.no_grad():
             # ---- compute flow ----
             new_longer_edge = max(frames.size(-1), frames.size(-2))
@@ -234,12 +288,15 @@ class Propainter:
                 short_clip_len = 4
             else:
                 short_clip_len = 2
+            print(f"根据图像大小({new_longer_edge})选择短片段长度: {short_clip_len}")
 
             # use fp32 for RAFT
             if frames.size(1) > short_clip_len:
+                print(f"视频长度({frames.size(1)})大于短片段长度({short_clip_len}), 分段处理...")
                 gt_flows_f_list, gt_flows_b_list = [], []
                 for f in range(0, video_length, short_clip_len):
                     end_f = min(video_length, f + short_clip_len)
+                    print(f"处理片段 {f} -> {end_f}")
                     if f == 0:
                         flows_f, flows_b = self.fix_raft(frames[:,f:end_f], iters=raft_iter)
                     else:
@@ -252,8 +309,15 @@ class Propainter:
                 gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
                 gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
                 gt_flows_bi = (gt_flows_f, gt_flows_b)
+                print(f"光流计算完成:")
+                print(f"- 前向光流形状: {gt_flows_f.shape}")
+                print(f"- 后向光流形状: {gt_flows_b.shape}")
             else:
+                print(f"视频长度({frames.size(1)})小于等于短片段长度({short_clip_len}), 直接处理...")
                 gt_flows_bi = self.fix_raft(frames, iters=raft_iter)
+                print(f"光流计算完成:")
+                print(f"- 前向光流形状: {gt_flows_bi[0].shape}")
+                print(f"- 后向光流形状: {gt_flows_bi[1].shape}")
                 torch.cuda.empty_cache()
             torch.cuda.empty_cache()
             gc.collect()

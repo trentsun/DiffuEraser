@@ -62,7 +62,7 @@ def gpu_is_available():
             return True
     return True if torch.cuda.is_available() and torch.backends.cudnn.is_available() else False
 
-def get_device(gpu_id=None):
+def get_device(gpu_id=1):
     if gpu_id is None:
         gpu_str = ''
     elif isinstance(gpu_id, int):

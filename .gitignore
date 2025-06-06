@@ -1,0 +1,6 @@
+weights/
+*__pycache__*
+*.mp4
+generate_mask_from_ocr.py
+ocr_result.json
+source_code

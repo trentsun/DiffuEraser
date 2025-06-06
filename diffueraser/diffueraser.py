@@ -5,6 +5,7 @@ import os
 import numpy as np
 import torch
 import torchvision
+import traceback  # 添加 traceback 导入
 from einops import repeat
 from PIL import Image, ImageFilter
 from diffusers import (
@@ -83,6 +84,7 @@ def read_mask(validation_mask, fps, n_total_frames, img_size, mask_dilation_iter
 
     masks = []
     masked_images = []
+    valid_frame_indices = []  # 新增:记录有效掩码的帧索引
     idx = 0
     while True:
         ret, frame = cap.read()
@@ -94,6 +96,12 @@ def read_mask(validation_mask, fps, n_total_frames, img_size, mask_dilation_iter
         if mask.size != img_size:
             mask = mask.resize(img_size, Image.NEAREST)
         mask = np.asarray(mask)
+        
+        # 判断当前帧是否有掩码
+        if not np.any(mask):  # 如果掩码全为0,跳过这一帧
+            idx += 1
+            continue
+            
         m = np.array(mask > 0).astype(np.uint8)
         m = cv2.erode(m,
                     cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
@@ -108,11 +116,12 @@ def read_mask(validation_mask, fps, n_total_frames, img_size, mask_dilation_iter
         masked_image = np.array(frames[idx])*(1-(np.array(mask)[:,:,np.newaxis].astype(np.float32)/255))
         masked_image = Image.fromarray(masked_image.astype(np.uint8))
         masked_images.append(masked_image)
-
+        
+        valid_frame_indices.append(idx)  # 记录有效帧的索引
         idx += 1
     cap.release()
 
-    return masks, masked_images
+    return masks, masked_images, valid_frame_indices  # 返回有效帧索引
 
 def read_priori(priori, fps, n_total_frames, img_size):
     cap = cv2.VideoCapture(priori)
@@ -212,9 +221,9 @@ class DiffuEraser:
             unet=self.unet_main,
             brushnet=self.brushnet
         ).to(self.device, torch.float16)
+        
         self.pipeline.scheduler = UniPCMultistepScheduler.from_config(self.pipeline.scheduler.config)
         self.pipeline.set_progress_bar_config(disable=True)
-
         self.noise_scheduler = UniPCMultistepScheduler.from_config(self.pipeline.scheduler.config)
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True)
@@ -240,53 +249,134 @@ class DiffuEraser:
                     timestep_spacing="trailing",
                 )
         self.num_inference_steps = checkpoints[ckpt][1]
+        print(f"num_inference_steps: {self.num_inference_steps}")
         self.guidance_scale = 0
 
-    def forward(self, validation_image, validation_mask, priori, output_path,
+    def forward(self, frames, masks, priori, output_path,
                 max_img_size = 1280, video_length=2, mask_dilation_iter=4,
                 nframes=22, seed=None, revision = None, guidance_scale=None, blended=True):
+        """
+        主要的处理函数，完成视频修复的整个流程
+        
+        参数:
+        - frames: 输入视频帧列表
+        - masks: 输入掩码列表
+        - priori: 先验视频路径
+        - output_path: 输出视频路径
+        - max_img_size: 最大图像尺寸
+        - video_length: 处理的视频长度
+        - mask_dilation_iter: 掩码扩张程度
+        - nframes: 每次处理的帧数
+        - seed: 随机种子
+        - revision: 模型版本
+        - guidance_scale: 引导尺度
+        - blended: 是否使用混合
+        """
+        import time
+        start_time = time.time()
+        
+        print("\n=== DiffuEraser 处理开始 ===")
+        
+        # 筛选有掩码的帧
+        valid_frame_indices = []
+        for i, mask in enumerate(masks):
+            if np.any(np.array(mask)):  # 检查掩码是否包含非零值
+                valid_frame_indices.append(i)
+                
+        if not valid_frame_indices:
+            print("没有检测到需要处理的掩码，直接返回原始帧")
+            return frames
+            
+        print(f"处理总帧数: {len(frames)}, 需要处理的帧数: {len(valid_frame_indices)}")
+        
         validation_prompt = ""  # 
         guidance_scale_final = self.guidance_scale if guidance_scale==None else guidance_scale
 
         if (max_img_size<256 or max_img_size>1920):
             raise ValueError("The max_img_size must be larger than 256, smaller than 1920.")
 
-        ################ read input video ################ 
-        frames, fps, img_size, n_clip, n_total_frames = read_video(validation_image, video_length, nframes, max_img_size)
-        video_len = len(frames)
+        ################ 处理输入帧 ################ 
+        t0 = time.time()
+        # 计算目标尺寸
+        img_size = frames[0].size
+        max_size = max(img_size)
+        
+        if(max_size<256):
+            raise ValueError("The resolution of the input frames must be larger than 256x256.")
+        if(max_size>4096):
+            raise ValueError("The resolution of the input frames must be smaller than 4096x4096.")
+            
+        if max_size>max_img_size:
+            ratio = max_size/max_img_size
+            ratio_size = (int(img_size[0]/ratio),int(img_size[1]/ratio))
+            img_size = (ratio_size[0]-ratio_size[0]%8, ratio_size[1]-ratio_size[1]%8)
+            resize_flag=True
+        elif (img_size[0]%8==0) and (img_size[1]%8==0):
+            resize_flag=False
+        else:
+            ratio_size = img_size
+            img_size = (ratio_size[0]-ratio_size[0]%8, ratio_size[1]-ratio_size[1]%8)
+            resize_flag=True
+            
+        if resize_flag:
+            frames = resize_frames(frames, img_size)
+            masks = resize_frames(masks, img_size)
+        print(f"帧处理完成，耗时: {time.time() - t0:.2f}秒")
+        print(f"处理分辨率: {img_size}")
 
-        ################     read mask    ################ 
-        validation_masks_input, validation_images_input = read_mask(validation_mask, fps, video_len, img_size, mask_dilation_iter, frames)
-  
-        ################    read priori   ################  
-        prioris = read_priori(priori, fps, n_total_frames, img_size)
+        ################ 读取先验视频 ################
+        t0 = time.time()
+        cap = cv2.VideoCapture(priori)
+        if not cap.isOpened():
+            print("Error: Could not open priori video.")
+            return frames
+            
+        prioris = []
+        frame_count = 0
+        while frame_count < len(frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            img = Image.fromarray(frame[...,::-1])
+            if img.size != img_size:
+                img = img.resize(img_size)
+            if frame_count in valid_frame_indices:
+                prioris.append(img)
+            frame_count += 1
+        cap.release()
+        os.remove(priori)
+        print(f"先验视频处理完成，耗时: {time.time() - t0:.2f}秒")
 
-        ## recheck
-        n_total_frames = min(min(len(frames), len(validation_masks_input)), len(prioris))
-        if(n_total_frames<22):
-            raise ValueError("The effective video duration is too short. Please make sure that the number of frames of video, mask, and priori is at least greater than 22 frames.")
-        validation_masks_input = validation_masks_input[:n_total_frames]
-        validation_images_input = validation_images_input[:n_total_frames]
-        frames = frames[:n_total_frames]
-        prioris = prioris[:n_total_frames]
+        ################ 准备数据 ################
+        t0 = time.time()
+        validation_images_input = []
+        process_frames = []
+        process_masks = []
+        
+        for idx in valid_frame_indices:
+            frame = frames[idx]
+            mask = masks[idx]
+            process_frames.append(frame)
+            process_masks.append(mask)
+            masked_image = np.array(frame)*(1-(np.array(mask)[:,:,np.newaxis].astype(np.float32)/255))
+            masked_image = Image.fromarray(masked_image.astype(np.uint8))
+            validation_images_input.append(masked_image)
+        print(f"数据准备完成，耗时: {time.time() - t0:.2f}秒")
 
-        prioris = resize_frames(prioris)
-        validation_masks_input = resize_frames(validation_masks_input)
-        validation_images_input = resize_frames(validation_images_input)
-        resized_frames = resize_frames(frames)
-
-        ##############################################
-        # DiffuEraser inference
-        ##############################################
-        print("DiffuEraser inference...")
+        ################ 模型推理 ################
+        print("\n开始模型推理...")
+        inference_start = time.time()
+        
         if seed is None:
+            print("使用随机种子")
             generator = None
         else:
+            print(f"使用固定种子: {seed}")
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        ## random noise
-        real_video_length = len(validation_images_input)
-        tar_width, tar_height = validation_images_input[0].size 
+        # 准备噪声
+        t0 = time.time()
+        tar_width, tar_height = frames[0].size
         shape = (
             nframes,
             4,
@@ -299,17 +389,22 @@ class DiffuEraser:
             prompt_embeds_dtype = self.unet_main.dtype
         else:
             prompt_embeds_dtype = torch.float16
-        noise_pre = randn_tensor(shape, device=torch.device(self.device), dtype=prompt_embeds_dtype, generator=generator) 
-        noise = repeat(noise_pre, "t c h w->(repeat t) c h w", repeat=n_clip)[:real_video_length,...]
-        
-        ################  prepare priori  ################
+            
+        noise_pre = randn_tensor(shape, device=torch.device(self.device), dtype=prompt_embeds_dtype, generator=generator)
+        noise = repeat(noise_pre, "t c h w->(repeat t) c h w", repeat=int(np.ceil(len(valid_frame_indices)/nframes)))[:len(valid_frame_indices),...]
+        print(f"噪声准备完成，耗时: {time.time() - t0:.2f}秒")
+
+        # 处理先验
+        t0 = time.time()
         images_preprocessed = []
         for image in prioris:
             image = self.image_processor.preprocess(image, height=tar_height, width=tar_width).to(dtype=torch.float32)
             image = image.to(device=torch.device(self.device), dtype=torch.float16)
             images_preprocessed.append(image)
         pixel_values = torch.cat(images_preprocessed)
+        print(f"先验预处理完成，耗时: {time.time() - t0:.2f}秒")
 
+        t0 = time.time()
         with torch.no_grad():
             pixel_values = pixel_values.to(dtype=torch.float16)
             latents = []
@@ -317,30 +412,42 @@ class DiffuEraser:
             for i in range(0, pixel_values.shape[0], num):
                 latents.append(self.vae.encode(pixel_values[i : i + num]).latent_dist.sample())
             latents = torch.cat(latents, dim=0)
-        latents = latents * self.vae.config.scaling_factor #[(b f), c1, h, w], c1=4
-        torch.cuda.empty_cache()  
+        latents = latents * self.vae.config.scaling_factor
+        print(f"潜在编码完成，耗时: {time.time() - t0:.2f}秒")
+
         timesteps = torch.tensor([0], device=self.device)
         timesteps = timesteps.long()
 
-        validation_masks_input_ori = copy.deepcopy(validation_masks_input)
-        resized_frames_ori = copy.deepcopy(resized_frames)
-        ################  Pre-inference  ################
-        if n_total_frames > nframes*2: ## do pre-inference only when number of input frames is larger than nframes*2
+        validation_masks_input_ori = copy.deepcopy(process_masks)
+        resized_frames_ori = copy.deepcopy(process_frames)
+
+        ################ 预推理阶段 ################
+        t0 = time.time()
+        if len(valid_frame_indices) > 0 and process_frames and nframes > 0:
+            print("\n执行预推理阶段...")
             ## sample
-            step = n_total_frames / nframes
-            sample_index = [int(i * step) for i in range(nframes)]
-            sample_index = sample_index[:22]
-            validation_masks_input_pre = [validation_masks_input[i] for i in sample_index]
+            if len(valid_frame_indices) <= nframes:
+                # 如果有效帧数小于等于nframes，直接使用所有有效帧
+                sample_index = list(range(len(valid_frame_indices)))
+            else:
+                # 否则均匀采样
+                step = len(valid_frame_indices) / min(nframes, 22)  # 限制最大采样数为22
+                sample_index = [int(i * step) for i in range(min(nframes, 22))]
+                # 确保不会超出索引范围
+                sample_index = [i for i in sample_index if i < len(valid_frame_indices)]
+            
+            print(f"预推理采样帧数: {len(sample_index)}")
+            validation_masks_input_pre = [process_masks[i] for i in sample_index]
             validation_images_input_pre = [validation_images_input[i] for i in sample_index]
             latents_pre = torch.stack([latents[i] for i in sample_index])
 
-            ## add proiri
-            noisy_latents_pre = self.noise_scheduler.add_noise(latents_pre, noise_pre, timesteps) 
+            ## add priori
+            noisy_latents_pre = self.noise_scheduler.add_noise(latents_pre, noise_pre[:len(sample_index)], timesteps) 
             latents_pre = noisy_latents_pre
 
             with torch.no_grad():
                 latents_pre_out = self.pipeline(
-                    num_frames=nframes, 
+                    num_frames=len(sample_index),  # 使用实际的采样帧数
                     prompt=validation_prompt, 
                     images=validation_images_input_pre, 
                     masks=validation_masks_input_pre, 
@@ -357,75 +464,85 @@ class DiffuEraser:
                 for t in range(latents.shape[0]):
                     video.append(self.vae.decode(latents[t:t+1, ...].to(weight_dtype)).sample)
                 video = torch.concat(video, dim=0)
-                # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
                 video = video.float()
                 return video
+                
             with torch.no_grad():
                 video_tensor_temp = decode_latents(latents_pre_out, weight_dtype=torch.float16)
-                images_pre_out  = self.image_processor.postprocess(video_tensor_temp, output_type="pil")
+                images_pre_out = self.image_processor.postprocess(video_tensor_temp, output_type="pil")
             torch.cuda.empty_cache()  
 
             ## replace input frames with updated frames
-            black_image = Image.new('L', validation_masks_input[0].size, color=0)
+            black_image = Image.new('L', masks[0].size, color=0)
             for i,index in enumerate(sample_index):
                 latents[index] = latents_pre_out[i]
-                validation_masks_input[index] = black_image
+                process_masks[index] = black_image
                 validation_images_input[index] = images_pre_out[i]
-                resized_frames[index] = images_pre_out[i]
+                process_frames[index] = images_pre_out[i]
+            print(f"预推理完成，耗时: {time.time() - t0:.2f}秒")
         else:
-            latents_pre_out=None
-            sample_index=None
+            print("跳过预推理阶段(无有效帧)")
         gc.collect()
         torch.cuda.empty_cache()
 
-        ################  Frame-by-frame inference  ################
-        ## add priori
-        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps) 
+        ################ 主推理阶段 ################
+        print("\n开始主推理...")
+        t0 = time.time()
+        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
         latents = noisy_latents
+        
         with torch.no_grad():
-            images = self.pipeline(
-                num_frames=nframes, 
-                prompt=validation_prompt, 
-                images=validation_images_input, 
-                masks=validation_masks_input, 
-                num_inference_steps=self.num_inference_steps, 
+            processed_images = self.pipeline(
+                num_frames=nframes,
+                prompt=validation_prompt,
+                images=validation_images_input,
+                masks=process_masks,
+                num_inference_steps=self.num_inference_steps,
                 generator=generator,
                 guidance_scale=guidance_scale_final,
                 latents=latents,
             ).frames
-        images = images[:real_video_length]
+        print(f"主推理完成，耗时: {time.time() - t0:.2f}秒")
+        print(f"总推理耗时: {time.time() - inference_start:.2f}秒")
 
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        ################ Compose ################
-        binary_masks = validation_masks_input_ori
-        mask_blurreds = []
+        ################ 合成视频 ################
+        t0 = time.time()
+        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                            24, frames[0].size)
+                            
         if blended:
-            # blur, you can adjust the parameters for better performance
-            for i in range(len(binary_masks)):
-                mask_blurred = cv2.GaussianBlur(np.array(binary_masks[i]), (21, 21), 0)/255.
-                binary_mask = 1-(1-np.array(binary_masks[i])/255.) * (1-mask_blurred)
+            # 使用高斯模糊进行混合
+            mask_blurreds = []
+            for mask in validation_masks_input_ori:
+                mask_blurred = cv2.GaussianBlur(np.array(mask), (21, 21), 0)/255.
+                binary_mask = 1-(1-np.array(mask)/255.) * (1-mask_blurred)
                 mask_blurreds.append(Image.fromarray((binary_mask*255).astype(np.uint8)))
             binary_masks = mask_blurreds
+        else:
+            binary_masks = validation_masks_input_ori
         
-        comp_frames = []
-        for i in range(len(images)):
-            mask = np.expand_dims(np.array(binary_masks[i]),2).repeat(3, axis=2).astype(np.float32)/255.
-            img = (np.array(images[i]).astype(np.uint8) * mask \
-                + np.array(resized_frames_ori[i]).astype(np.uint8) * (1 - mask)).astype(np.uint8)
-            comp_frames.append(Image.fromarray(img))
-
-        default_fps = fps
-        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                            default_fps, comp_frames[0].size)
-        for f in range(real_video_length):
-            img = np.array(comp_frames[f]).astype(np.uint8)
-            writer.write(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        # 将处理后的帧插回原始帧列表
+        result_frames = frames.copy()
+        for idx, processed_idx in enumerate(valid_frame_indices):
+            mask = np.expand_dims(np.array(binary_masks[idx]),2).repeat(3, axis=2).astype(np.float32)/255.
+            img = (np.array(processed_images[idx]).astype(np.uint8) * mask \
+                + np.array(resized_frames_ori[idx]).astype(np.uint8) * (1 - mask)).astype(np.uint8)
+            if resize_flag:
+                img = cv2.resize(img, frames[0].size)
+            result_frames[processed_idx] = Image.fromarray(img)
+                            
+        # 写入所有帧
+        for frame in result_frames:
+            writer.write(cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR))
+                
         writer.release()
-        ################################
+        print(f"视频合成完成，耗时: {time.time() - t0:.2f}秒")
+        
+        total_time = time.time() - start_time
+        print("\n=== 处理完成 ===")
+        print(f"总耗时: {total_time:.2f}秒")
 
-        return output_path
+        return result_frames
             
 
 
