@@ -1126,11 +1126,17 @@ class StableDiffusionDiffuEraserPipeline(
                     context_list_choose = context_list
                     scheduler_status_choose = scheduler_status
 
+                t_context_total = 0
+                t_brushnet_total = 0
+                t_unet_total = 0
+                t_scheduler_total = 0
+                t_blend_total = 0
 
                 for j, context in enumerate(context_list_choose):
+                    t_context_start = time.time()
                     self.scheduler.__dict__.update(scheduler_status_choose[j])
-
                     latents_j = latents[context, :, :, :]
+                    t_context_total += time.time() - t_context_start
 
                     # Relevant thread:
                     # https://dev-discuss.pytorch.org/t/cudagraphs-in-pytorch-2-0/1428
@@ -1141,6 +1147,7 @@ class StableDiffusionDiffuEraserPipeline(
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                     # brushnet(s) inference
+                    t_brushnet_start = time.time()
                     if guess_mode and self.do_classifier_free_guidance:
                         # Infer BrushNet only for the conditional batch.
                         control_model_input = latents_j
@@ -1166,7 +1173,6 @@ class StableDiffusionDiffuEraserPipeline(
                             brushnet_cond_scale = brushnet_cond_scale[0]
                         cond_scale = brushnet_cond_scale * brushnet_keep[i]
 
-
                     down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
                         control_model_input,
                         t,
@@ -1176,6 +1182,7 @@ class StableDiffusionDiffuEraserPipeline(
                         guess_mode=guess_mode,
                         return_dict=False,
                     )
+                    t_brushnet_total += time.time() - t_brushnet_start
 
                     if guess_mode and self.do_classifier_free_guidance:
                         # Infered BrushNet only for the conditional batch.
@@ -1186,6 +1193,7 @@ class StableDiffusionDiffuEraserPipeline(
                         up_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples]
 
                     # predict the noise residual
+                    t_unet_start = time.time()
                     noise_pred = self.unet(
                         latent_model_input,
                         t,
@@ -1199,6 +1207,7 @@ class StableDiffusionDiffuEraserPipeline(
                         return_dict=False,
                         num_frames=num_frames,
                     )[0]
+                    t_unet_total += time.time() - t_unet_start
 
                     # perform guidance
                     if self.do_classifier_free_guidance:
@@ -1206,8 +1215,11 @@ class StableDiffusionDiffuEraserPipeline(
                         noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     # compute the previous noisy sample x_t -> x_t-1
+                    t_scheduler_start = time.time()
                     latents_j = self.scheduler.step(noise_pred, t, latents_j, **extra_step_kwargs, return_dict=False)[0]
+                    t_scheduler_total += time.time() - t_scheduler_start
 
+                    t_blend_start = time.time()
                     count[context, ...] += 1
 
                     if j==0:
@@ -1220,6 +1232,7 @@ class StableDiffusionDiffuEraserPipeline(
                         for i_overlap in overlap_index_list:
                             value[context[i_overlap], ...] = value[context[i_overlap], ...]*ratio_pre[i_overlap] + latents_j[i_overlap, ...]*ratio_next[i_overlap]
                         value[context[i_overlap:num_frames], ...] = latents_j[i_overlap:num_frames, ...]
+                    t_blend_total += time.time() - t_blend_start
 
                 latents = value.clone()
 
@@ -1243,8 +1256,14 @@ class StableDiffusionDiffuEraserPipeline(
                 step_time = time.time() - step_start
                 step_times.append(step_time)
                 if i % 10 == 0:  # 每10步打印一次
-                    print(f"[性能分析] 步骤 {i}/{len(timesteps)}, 当前步耗时: {step_time:.2f}s")
-                    print(f"[性能分析] GPU内存使用: {torch.cuda.memory_allocated()/1024**3:.1f}GB")
+                    print(f"\n[性能分析] 步骤 {i}/{len(timesteps)}:")
+                    print(f"  - 总耗时: {step_time:.2f}s")
+                    print(f"  - Context处理: {t_context_total:.2f}s")
+                    print(f"  - BrushNet推理: {t_brushnet_total:.2f}s")
+                    print(f"  - UNet推理: {t_unet_total:.2f}s")
+                    print(f"  - Scheduler更新: {t_scheduler_total:.2f}s")
+                    print(f"  - 图像融合: {t_blend_total:.2f}s")
+                    print(f"  - GPU内存使用: {torch.cuda.memory_allocated()/1024**3:.1f}GB")
 
         print(f"[性能分析] 去噪循环完成, 总耗时: {time.time() - denoising_start:.2f}s")
         if step_times:
