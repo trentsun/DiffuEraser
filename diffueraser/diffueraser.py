@@ -191,7 +191,7 @@ class DiffuEraser:
         self.device = device
 
         ## load model
-        self.vae = AutoencoderKL.from_pretrained(vae_path)
+        self.vae = AutoencoderKL.from_pretrained(vae_path).half().to(device)
         self.noise_scheduler = DDPMScheduler.from_pretrained(base_model_path, 
                 subfolder="scheduler",
                 prediction_type="v_prediction",
@@ -206,11 +206,11 @@ class DiffuEraser:
         text_encoder_cls = import_model_class_from_model_name_or_path(base_model_path,revision)
         self.text_encoder = text_encoder_cls.from_pretrained(
                 base_model_path, subfolder="text_encoder"
-            )
-        self.brushnet = BrushNetModel.from_pretrained(diffueraser_path, subfolder="brushnet")
+            ).half().to(device)
+        self.brushnet = BrushNetModel.from_pretrained(diffueraser_path, subfolder="brushnet").half().to(device)
         self.unet_main = UNetMotionModel.from_pretrained(
             diffueraser_path, subfolder="unet_main",
-        )
+        ).half().to(device)
 
         ## set pipeline
         self.pipeline = StableDiffusionDiffuEraserPipeline.from_pretrained(
