@@ -277,17 +277,13 @@ class DiffuEraser:
         
         print("\n=== DiffuEraser 处理开始 ===")
         
-        # 筛选有掩码的帧
+        # 记录有掩码的帧(仅用于显示信息)
         valid_frame_indices = []
         for i, mask in enumerate(masks):
             if np.any(np.array(mask)):  # 检查掩码是否包含非零值
                 valid_frame_indices.append(i)
                 
-        if not valid_frame_indices:
-            print("没有检测到需要处理的掩码，直接返回原始帧")
-            return frames
-            
-        print(f"处理总帧数: {len(frames)}, 需要处理的帧数: {len(valid_frame_indices)}")
+        print(f"处理总帧数: {len(frames)}, 其中有掩码的帧数: {len(valid_frame_indices)}")
         
         validation_prompt = ""  # 
         guidance_scale_final = self.guidance_scale if guidance_scale==None else guidance_scale
@@ -340,8 +336,7 @@ class DiffuEraser:
             img = Image.fromarray(frame[...,::-1])
             if img.size != img_size:
                 img = img.resize(img_size)
-            if frame_count in valid_frame_indices:
-                prioris.append(img)
+            prioris.append(img)
             frame_count += 1
         cap.release()
         os.remove(priori)
@@ -353,7 +348,7 @@ class DiffuEraser:
         process_frames = []
         process_masks = []
         
-        for idx in valid_frame_indices:
+        for idx in range(len(frames)):
             frame = frames[idx]
             mask = masks[idx]
             process_frames.append(frame)
@@ -391,7 +386,7 @@ class DiffuEraser:
             prompt_embeds_dtype = torch.float16
             
         noise_pre = randn_tensor(shape, device=torch.device(self.device), dtype=prompt_embeds_dtype, generator=generator)
-        noise = repeat(noise_pre, "t c h w->(repeat t) c h w", repeat=int(np.ceil(len(valid_frame_indices)/nframes)))[:len(valid_frame_indices),...]
+        noise = repeat(noise_pre, "t c h w->(repeat t) c h w", repeat=int(np.ceil(len(frames)/nframes)))[:len(frames),...]
         print(f"噪声准备完成，耗时: {time.time() - t0:.2f}秒")
 
         # 处理先验
@@ -423,18 +418,12 @@ class DiffuEraser:
 
         ################ 预推理阶段 ################
         t0 = time.time()
-        if len(valid_frame_indices) > 0 and process_frames and nframes > 0:
+        if len(frames) > nframes*2:  # 仅当帧数超过nframes*2时进行预推理
             print("\n执行预推理阶段...")
             ## sample
-            if len(valid_frame_indices) <= nframes:
-                # 如果有效帧数小于等于nframes，直接使用所有有效帧
-                sample_index = list(range(len(valid_frame_indices)))
-            else:
-                # 否则均匀采样
-                step = len(valid_frame_indices) / min(nframes, 22)  # 限制最大采样数为22
-                sample_index = [int(i * step) for i in range(min(nframes, 22))]
-                # 确保不会超出索引范围
-                sample_index = [i for i in sample_index if i < len(valid_frame_indices)]
+            step = len(frames) / nframes
+            sample_index = [int(i * step) for i in range(nframes)]
+            sample_index = sample_index[:22]  # 限制最大采样数为22
             
             print(f"预推理采样帧数: {len(sample_index)}")
             validation_masks_input_pre = [process_masks[i] for i in sample_index]
@@ -481,7 +470,7 @@ class DiffuEraser:
                 process_frames[index] = images_pre_out[i]
             print(f"预推理完成，耗时: {time.time() - t0:.2f}秒")
         else:
-            print("跳过预推理阶段(无有效帧)")
+            print("跳过预推理阶段(总帧数不足nframes*2)")
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -523,13 +512,13 @@ class DiffuEraser:
         
         # 将处理后的帧插回原始帧列表
         result_frames = frames.copy()
-        for idx, processed_idx in enumerate(valid_frame_indices):
+        for idx in range(len(frames)):
             mask = np.expand_dims(np.array(binary_masks[idx]),2).repeat(3, axis=2).astype(np.float32)/255.
             img = (np.array(processed_images[idx]).astype(np.uint8) * mask \
                 + np.array(resized_frames_ori[idx]).astype(np.uint8) * (1 - mask)).astype(np.uint8)
             if resize_flag:
                 img = cv2.resize(img, frames[0].size)
-            result_frames[processed_idx] = Image.fromarray(img)
+            result_frames[idx] = Image.fromarray(img)
                             
         # 写入所有帧
         for frame in result_frames:
