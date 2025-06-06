@@ -1106,6 +1106,8 @@ class StableDiffusionDiffuEraserPipeline(
         
 
         # 8. Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
         print("\n[性能分析] 开始去噪循环...")
         denoising_start = time.time()
         step_times = []
