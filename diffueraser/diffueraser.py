@@ -255,7 +255,7 @@ class DiffuEraser:
 
     def forward(self, frames, masks, priori, output_path,
                 max_img_size = 1280, video_length=2, mask_dilation_iter=4,
-                nframes=64, seed=None, revision = None, guidance_scale=None, blended=True):
+                nframes=32, seed=None, revision = None, guidance_scale=None, blended=True):
         """
         主要的处理函数，完成视频修复的整个流程
         
@@ -424,7 +424,7 @@ class DiffuEraser:
             ## sample
             step = len(frames) / nframes
             sample_index = [int(i * step) for i in range(nframes)]
-            sample_index = sample_index[:30]  # 限制最大采样数为22
+            sample_index = sample_index[:32]  # 限制最大采样数为22
             
             print(f"预推理采样帧数: {len(sample_index)}")
             validation_masks_input_pre = [process_masks[i] for i in sample_index]

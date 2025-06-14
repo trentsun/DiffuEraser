@@ -134,7 +134,7 @@ def generate_mask_from_ocr(video_path, ocr_json_path, output_path, mask_dilation
 
 if __name__ == "__main__":
     # 示例用法
-    video_path = "1.mp4"
+    video_path = "2.mp4"
     ocr_json_path = "ocr_result.json"
-    output_path = "mask.mp4"
+    output_path = "2_mask.mp4"
     generate_mask_from_ocr(video_path, ocr_json_path, output_path) 
